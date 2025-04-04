@@ -1,174 +1,145 @@
-import asyncio
 import logging
-import json
-import os
-import pandas as pd
 import yfinance as yf
-import talib
 import requests
-from datetime import datetime, time
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, CallbackContext
+import json
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, CallbackContext
 
-# Configure logging
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-
-# Telegram Bot Token
+# Replace with your actual Telegram bot token
 BOT_TOKEN = "8037887985:AAGSBvWLulEfB2lFUKe2KjQH_jzdgTgqFr8
 "
 
-# Load or initialize portfolio
-PORTFOLIO_FILE = "portfolio.json"
-if os.path.exists(PORTFOLIO_FILE):
-    with open(PORTFOLIO_FILE, "r") as file:
-        portfolio = json.load(file)
-else:
-    portfolio = {}
+# Render Webhook URL (Replace with your Render deployment URL)
+WEBHOOK_URL = "https://your-render-app-url.com/webhook"
 
-# Function to check if the market is open
-def is_market_open():
-    now = datetime.now()
-    current_time = now.time()
-    market_start = time(9, 15)
-    market_end = time(15, 30)
-    return now.weekday() < 5 and market_start <= current_time <= market_end
+# Set up logging
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Function to fetch NSE and BSE symbols
-def fetch_stock_symbols():
-    # Fetch NSE symbols
-    nse_url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(nse_url, headers=headers)
-    nse_symbols = []
-    if response.status_code == 200:
-        data = response.json()
-        nse_symbols = [item['symbol'] + ".NS" for item in data['data']]
+# Function to fetch stock data
+def get_stock_data(symbol):
+    try:
+        stock = yf.Ticker(symbol)
+        data = stock.history(period="1d")
+        if data.empty:
+            return None
+        latest_price = data["Close"].iloc[-1]
+        return latest_price
+    except Exception as e:
+        logger.error(f"Error fetching stock data for {symbol}: {e}")
+        return None
 
-    # Fetch BSE symbols
-    bse_url = "https://www.bseindia.com/download/BhavCopy/Equity/EQ_ISINCODE_{}.zip".format(datetime.now().strftime("%d%m%y"))
-    response = requests.get(bse_url, headers=headers)
-    bse_symbols = []
-    if response.status_code == 200:
-        with open("bse_data.zip", "wb") as file:
-            file.write(response.content)
-        # Extract and read the CSV file from the ZIP archive
-        # (Implementation depends on the structure of the ZIP file)
+# Fetch latest market news (Moneycontrol API)
+def get_market_news():
+    try:
+        response = requests.get("https://newsapi.org/v2/top-headlines?category=business&apiKey=YOUR_NEWSAPI_KEY")
+        news = response.json()
+        articles = news["articles"][:3]  # Get top 3 news headlines
+        news_text = "\n\n".join([f"📰 {article['title']}" for article in articles])
+        return news_text
+    except Exception as e:
+        logger.error(f"Error fetching market news: {e}")
+        return "No market news available."
 
-    return nse_symbols, bse_symbols
+# AI-based trade signal generation
+def generate_trade_signal(symbol):
+    try:
+        stock = yf.Ticker(symbol)
+        data = stock.history(period="1d")
+        if data.empty:
+            return None
+        
+        # Get latest close price
+        close_price = data["Close"].iloc[-1]
 
-# Function to fetch recent news for a stock
-def fetch_recent_news(symbol):
-    search_url = f"https://newsapi.org/v2/everything?q={symbol}&apiKey=YOUR_NEWSAPI_KEY"
-    response = requests.get(search_url)
-    if response.status_code == 200:
-        articles = response.json().get("articles", [])
-        if articles:
-            return articles[0]["title"]
-    return None
+        # Generate simple trade signals
+        buy_price = close_price * 1.01
+        target_price = buy_price * 1.02
+        stop_loss = close_price * 0.98
 
-# Function to calculate stop loss and target prices
-def calculate_trade_levels(entry_price):
-    stop_loss = entry_price * 0.98  # 2% below entry
-    target = entry_price * 1.05     # 5% above entry
-    return round(stop_loss, 2), round(target, 2)
+        return f"📊 Signal for {symbol}:\n🔹 Buy above: ₹{buy_price:.2f}\n🎯 Target: ₹{target_price:.2f}\n🛑 Stop Loss: ₹{stop_loss:.2f}"
+    except Exception as e:
+        logger.error(f"Error generating trade signal for {symbol}: {e}")
+        return None
 
-# Function to scan for trade signals
-async def scan_for_signals(update: Update, context: CallbackContext):
-    if not is_market_open():
-        await update.message.reply_text("The market is currently closed. Signals are generated only during market hours.")
-        return
-
-    nse_symbols, bse_symbols = fetch_stock_symbols()
-    all_symbols = nse_symbols + bse_symbols
-
-    for symbol in all_symbols:
-        try:
-            stock = yf.Ticker(symbol)
-            df = stock.history(period="15d", interval="1d")
-            if df.empty or len(df) < 15:
-                continue
-
-            close = df["Close"]
-            rsi = talib.RSI(close, timeperiod=14)
-            macd, macd_signal, _ = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-
-            if rsi.iloc[-1] < 30 and macd.iloc[-1] > macd_signal.iloc[-1]:
-                entry_price = close.iloc[-1]
-                stop_loss, target = calculate_trade_levels(entry_price)
-                news = fetch_recent_news(symbol)
-                if news and any(neg_word in news.lower() for neg_word in ["fraud", "loss", "penalty"]):
-                    continue
-
-                signal = {
-                    "symbol": symbol,
-                    "entry_price": entry_price,
-                    "stop_loss": stop_loss,
-                    "target": target,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "news": news
-                }
-                portfolio[symbol] = signal
-                with open(PORTFOLIO_FILE, "w") as file:
-                    json.dump(portfolio, file)
-
-                message = (
-                    f"📈 *Trade Signal Detected!*\n\n"
-                    f"*Symbol:* {symbol}\n"
-                    f"*Entry Price:* ₹{entry_price:.2f}\n"
-                    f"*Stop Loss:* ₹{stop_loss:.2f}\n"
-                    f"*Target Price:* ₹{target:.2f}\n"
-                    f"*Time:* {signal['timestamp']}\n"
-                )
-                if news:
-                    message += f"*Recent News:* {news}\n"
-                await update.message.reply_text(message, parse_mode="Markdown")
-
-        except Exception as e:
-            logging.warning(f"Failed to process {symbol}: {e}")
-
-# Command handlers
+# Start command
 async def start(update: Update, context: CallbackContext):
-    commands = (
-        "/start - Start bot\n"
-        "/menu - Show available commands\n"
-        "/check_stock SYMBOL - Check stock data\n"
-        "/get_signal - Manually fetch trade signals\n"
-        "/portfolio - View your portfolio"
-    )
-    await update.message.reply_text(f"Welcome! Use the commands below:\n\n{commands}")
+    keyboard = [
+        [InlineKeyboardButton("🔍 Scan Market", callback_data='scan')],
+        [InlineKeyboardButton("📈 Portfolio", callback_data='portfolio')],
+        [InlineKeyboardButton("📰 Market News", callback_data='news')],
+        [InlineKeyboardButton("⚡ Manual Signal", callback_data='manual_signal')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Welcome to Stock Trading Bot! Choose an option:", reply_markup=reply_markup)
 
-async def menu(update: Update, context: CallbackContext):
-    commands = (
-        "/check_stock SYMBOL - Get stock data\n"
-        "/get_signal - Manually fetch trade signals\n"
-        "/portfolio - View your portfolio"
-    )
-    await update.message.reply_text(f"Here are the available commands:\n\n{commands}")
+# Button handler
+async def button_handler(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
 
-async def check_stock(update: Update, context: CallbackContext):
+    if query.data == "scan":
+        await query.edit_message_text("Scanning market for best trade signals...")
+
+        # Fetch best trade signal (Replace with real scanning logic)
+        stock_list = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFC.NS"]
+        signals = [generate_trade_signal(stock) for stock in stock_list]
+
+        signals_text = "\n\n".join(filter(None, signals))
+        await query.message.reply_text(signals_text if signals_text else "No strong trade signals found today.")
+    
+    elif query.data == "portfolio":
+        await query.edit_message_text("📊 Your past trades will be shown here soon!")
+    
+    elif query.data == "news":
+        news = get_market_news()
+        await query.message.reply_text(f"📰 Market News:\n\n{news}")
+
+    elif query.data == "manual_signal":
+        await query.edit_message_text("Send a stock symbol to generate a signal. Example: `/signal TCS.NS`")
+
+# Manual Signal Command
+async def manual_signal(update: Update, context: CallbackContext):
     if len(context.args) == 0:
-        await update.message.reply_text("Usage: /check_stock SYMBOL (e.g., /check_stock RELIANCE.NS)")
+        await update.message.reply_text("Usage: `/signal SYMBOL` (e.g., `/signal TCS.NS`)")
         return
-
+    
     symbol = context.args[0]
-    stock = yf.Ticker(symbol)
-    data = stock.history(period="1d")
-
-    if data.empty:
-        await update.message.reply_text("Invalid stock symbol. Try again.")
+    signal = generate_trade_signal(symbol)
+    
+    if signal:
+        await update.message.reply_text(signal)
     else:
-        price = data["Close"].iloc[-1]
-        await update.message.reply_text(f"📈 {symbol} latest price: ₹{price:.2f}")
+        await update.message.reply_text("Could not generate signal. Try another stock.")
 
-async def get_signal(update: Update, context: CallbackContext):
-    await scan_for_signals(update, context)
+# Webhook setup
+async def set_webhook():
+    app = Application.builder().token(BOT_TOKEN).build()
+    await app.bot.set_webhook(WEBHOOK_URL)
 
-async def portfolio(update: Update, context: CallbackContext):
-    if not portfolio:
-        await update.message.reply_text("Your portfolio is currently empty.")
-        return
+# Main function
+async def main():
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    message = "📊 *Your Portfolio:*\n\n"
-    for symbol, details in portfolio.items
-::contentReference[oaicite:0]{index=0}
- 
+    # Set Webhook
+    await set_webhook()
+
+    # Add command handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signal", manual_signal))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Set bot commands
+    commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("signal", "Generate a manual trade signal"),
+    ]
+    await app.bot.set_my_commands(commands)
+
+    # Start webhook listener
+    await app.run_webhook(listen="0.0.0.0", port=8443, webhook_url=WEBHOOK_URL)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
